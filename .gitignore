@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# snyk-hybrid-project-manager
+logs/
+config.yaml
+TEST_PLAN.md 

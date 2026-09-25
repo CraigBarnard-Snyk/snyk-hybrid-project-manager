@@ -1,0 +1,57 @@
+# snyk-hybrid-project-manager configuration
+#
+# The API token is NEVER read from this file. Export SNYK_TOKEN with a service
+# account that has View Projects (org.project.read) and Remove Projects
+# (org.project.delete).
+
+# --- The decision -----------------------------------------------------------
+# Which copy of a duplicate to DELETE. The other side is kept.
+#   scm -> delete the SCM-imported project, keep the CLI one (default)
+#   cli -> delete the CLI-monitored project, keep the SCM one
+delete: scm
+
+# --- Which orgs to process --------------------------------------------------
+# Give a list of org ids, a group, or both (the union is processed).
+orgs:
+  - 99999999-8888-7777-6666-555555555555
+
+# group:
+#   id: 11111111-2222-3333-4444-555555555555
+#   # Org ids, slugs, or display names to leave alone. An org listed under
+#   # `orgs` is processed even if it also appears here.
+#   exclude_orgs:
+#     - sandbox
+
+# Regional tenant: https://api.snyk.io | https://api.eu.snyk.io | https://api.au.snyk.io
+api_url: https://api.snyk.io
+
+# --- Rarely needed ----------------------------------------------------------
+
+# How a CLI project's branch is treated. The CLI does not record a branch unless
+# the run passes --target-reference, so branch-to-branch matching is not
+# possible; these two modes are about which SCM projects are *eligible*.
+#   ignore      -> branch plays no part (default)
+#   scm_default -> only pair against SCM projects on the repo's default branch.
+#                  Use this if your SCM integration monitors several branches per
+#                  repo, otherwise one CLI project can match them all at once.
+# branch_match: ignore
+
+# Used only by branch_match: scm_default. The REST API does not expose a
+# target's default branch, so the first of these names present on the repo wins;
+# failing that, the branch carrying the most projects.
+# default_branches:
+#   - main
+#   - master
+
+# Safety valve: skip an org entirely if its plan would delete more than this
+# many projects. Omit or set to null for no cap.
+# max_deletes_per_org: 25
+
+# log_dir: ./logs
+
+# "token" for a Snyk API/service account token, "bearer" for an OAuth token.
+# auth_scheme: token
+
+# Pinned Snyk REST API version. Must be 2024-10-15 or later -- that is the
+# first version exposing POST /orgs/{org_id}/projects/bulk-delete.
+# api_version: "2026-03-25"
