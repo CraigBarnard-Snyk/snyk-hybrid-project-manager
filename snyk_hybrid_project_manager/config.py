@@ -21,6 +21,7 @@ DEFAULT_API_URL = "https://api.snyk.io"
 
 DELETE_SIDES = ("scm", "cli")
 BRANCH_MATCH_MODES = ("ignore", "scm_default")
+MATCH_LEVELS = ("repo", "org")
 AUTH_SCHEMES = ("token", "bearer")
 
 DEFAULT_BRANCHES = ("main", "master")
@@ -106,7 +107,11 @@ class Config:
     api_url: str = DEFAULT_API_URL
     api_version: str = DEFAULT_API_VERSION
     auth_scheme: str = "token"
+    match_level: str = "repo"
     branch_match: str = "ignore"
+    # Inactive projects are skipped unless this is on, and even then only on the
+    # side being deleted -- never as the side being kept.
+    delete_inactive: bool = False
     default_branches: tuple[str, ...] = DEFAULT_BRANCHES
     max_deletes_per_org: int | None = None
     log_dir: str = "./logs"
@@ -146,6 +151,15 @@ def _one_of(value: Any, allowed: tuple[str, ...], where: str) -> str:
     if not isinstance(value, str) or value.lower() not in allowed:
         raise ConfigError(f"{where} must be one of {', '.join(allowed)}, got {value!r}")
     return value.lower()
+
+
+def _bool(value: Any, where: str) -> bool:
+    """Require a real YAML boolean. A truthy string is a typo, not a yes."""
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where} must be true or false, got {value!r}")
+    return value
 
 
 def _positive_int(value: Any, where: str) -> int | None:
@@ -203,6 +217,8 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         "delete",
         "orgs",
         "group",
+        "match_level",
+        "delete_inactive",
         "api_url",
         "api_version",
         "auth_scheme",
@@ -253,6 +269,8 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         api_url=api_url.strip().rstrip("/"),
         api_version=api_version,
         auth_scheme=_one_of(data.get("auth_scheme", "token"), AUTH_SCHEMES, "auth_scheme"),
+        match_level=_one_of(data.get("match_level", "repo"), MATCH_LEVELS, "match_level"),
+        delete_inactive=_bool(data.get("delete_inactive"), "delete_inactive"),
         branch_match=_one_of(
             data.get("branch_match", "ignore"), BRANCH_MATCH_MODES, "branch_match"
         ),

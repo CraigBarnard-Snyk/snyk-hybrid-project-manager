@@ -67,6 +67,35 @@ WARNING  github.com/acme/api: deleting 10 scm project(s) but keeping only 1 cli 
 **Read these before your first `--execute`.** `--review` asks about each repo from a terminal; on a
 cron there's no TTY, so it warns and carries on as planned.
 
+### Looser matching: `match_level: org`
+
+`match_level: org` (or `--match-level org`) stops comparing repo URLs altogether. If an org holds
+even one Open Source project on the side you're keeping, **every** Open Source project on the side
+you're deleting goes, whatever repo it belongs to. An org with nothing on the keeping side loses
+nothing.
+
+With `delete: scm`, one CLI project anywhere in the org condemns every SCM-imported Open Source
+project in it. With `delete: cli` it works the other way round.
+
+Use it when you know an org has moved to CLI scanning wholesale and you want the SCM-imported Open
+Source projects gone, including in repos the CLI hasn't reached yet. The trade-off is blunt: repos
+covered only by the SCM integration lose Open Source monitoring entirely, and repo-by-repo
+`coverage_drop` warnings no longer tell you which, because there is no per-repo comparison left to
+make. Every affected project is still named in the log with its own repo URL.
+
+Everything else is unchanged. Snyk Code, Container and IaC are never touched, inactive and
+unclassified projects are still skipped, and `max_deletes_per_org` still caps the damage. The one
+other difference is that a project with no repo URL is no longer skipped: nothing is being matched on
+a URL, so a CLI project scanned without a `.git` directory still counts as evidence.
+
+The run log says so at the top, and the plan is recorded under `repo_url: <entire org>`:
+
+```
+WARNING  Match level: ORG. Repo URLs are not compared. In any org holding at least one open
+         source cli project, EVERY open source scm project is deleted, whatever repo it
+         belongs to. Read the dry run before using --execute.
+```
+
 ## Which projects are eligible
 
 Only these types: `npm`, `yarn`, `yarn-workspace`, `pnpm`, `maven`, `gradle`, `sbt`, `pip`, `poetry`,
@@ -79,8 +108,31 @@ Open Source and deleted, so a new Snyk product is safe by default. The trade-off
 package manager needs adding before the tool will touch it. Every run logs the types it saw in
 `org_summary`, so unrecognised ones show up in the report.
 
-Inactive projects are skipped too, as are origins on neither list (`api`, for example, where there's
-no way to tell which side created it).
+Origins on neither list are skipped as well (`api`, for example, where there's no way to tell which
+side created it).
+
+### Inactive projects
+
+Inactive projects are skipped by default. A project goes inactive for two reasons the API can't tell
+apart: Snyk deactivates one automatically when its manifest is deleted or renamed, but a person can
+also deactivate one deliberately, and Snyk won't reactivate those during a sync. Deleting the second
+kind throws away a decision someone made, along with the project's history and ignores.
+
+`delete_inactive: true` (or `--delete-inactive`) includes them. Two things stay true when it's on:
+
+- **An inactive project is only ever deleted, never kept.** A repo whose CLI project is inactive
+  doesn't lose its live SCM projects, and an org whose only CLI projects are inactive deletes
+  nothing. Keeping a dead project in place of a live one would leave the repo unmonitored.
+- **Only an explicitly inactive status counts.** A project with a missing or unrecognised status is
+  still skipped rather than assumed dead.
+
+Each run reports how many of the projects it would delete are already inactive, so you can see how
+much of a plan is tidying and how much is live monitoring.
+
+Note that deleting is not deactivating. If a project was deactivated by hand but its manifest is
+still in the repo, deleting it lets the next sync create a **new active** project in its place.
+`exclude_from_future_scans` is what stops that, at the cost of one of the repo's 100 exclusion
+slots.
 
 ## Install
 
@@ -122,6 +174,8 @@ Flags override the config file, and each override is logged as a warning at the 
 | `--dry-run` | Ask for the default behaviour explicitly. |
 | `--org ORG_ID` | Only process this org id. Repeatable. |
 | `--delete {scm,cli}` | Override which side to delete. |
+| `--match-level {repo,org}` | Override match strictness. `org` is much looser — see above. |
+| `--delete-inactive` | Also delete inactive projects on the side being deleted. |
 | `--branch-match {ignore,scm_default}` | Override branch handling. |
 | `--max-deletes-per-org N` | Skip any org whose plan exceeds N deletions. |
 | `--no-exclude-from-future-scans` | Delete SCM projects without excluding them from future scans. |
@@ -167,7 +221,9 @@ conflict is logged.
 One set of settings applies to every org. If two orgs need different settings, run the tool twice
 with two configs.
 
-The rest is optional: `api_url`, `branch_match`, `default_branches`, `max_deletes_per_org`,
+The rest is optional: `api_url`, `match_level`, `delete_inactive`, `branch_match`,
+`default_branches`,
+`max_deletes_per_org`,
 `log_dir`, `auth_scheme`, and `api_version` (`2024-10-15` or later, the first version with
 `bulk-delete`; default `2026-03-25`). [`config.example.yaml`](config.example.yaml) documents them.
 
@@ -198,12 +254,12 @@ A *duplicate* is a repo covered by both sides. Counts are of projects, so `4 dup
 
 | `event` | Meaning |
 |---|---|
-| `run_start` | Settings in use, including flag overrides. |
+| `run_start` | Settings in use, including `match_level` and flag overrides. |
 | `org_excluded` | Org skipped per `exclude_orgs`. |
-| `org_summary` | Per-org counts, skip reasons, and types seen. `projects_to_delete` is what would actually go, which is lower than `duplicate_projects` if a repo was capped or skipped in review. |
+| `org_summary` | Per-org counts, skip reasons, and types seen. `projects_to_delete` is what would actually go, which is lower than `duplicate_projects` if a repo was capped or skipped in review; `inactive_projects_to_delete` is how many of those are already inactive. |
 | `skipped` | A project left out of matching, with the reason. `non_oss_type` and `inactive` are only counted here unless `--log-all-skips`. |
 | `unmatched` | A repo monitored from one side only (`--log-all-skips`). Read these first if a run finds no duplicates: the `repo_url` each side resolved to is what needed to match. |
-| `duplicate` | A repo covered by both sides, with `deleting[]`, `keeping[]`, `coverage_drop`, and `action`. |
+| `duplicate` | A repo covered by both sides, with `deleting[]`, `keeping[]`, `coverage_drop`, and `action`. Under `match_level: org` there is one record per org instead, with `repo_url: <entire org>`; each project in `deleting[]` still carries its own `canonical_repo_url`. |
 | `deletion` | What the API did per project: `deleted`, `failed` with a reason, or `not_reported`. |
 | `org_failed` / `run_failed` | An API failure that stopped an org, or the run. |
 | `run_summary` | Totals. |

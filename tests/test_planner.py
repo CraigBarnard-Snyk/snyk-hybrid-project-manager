@@ -375,3 +375,252 @@ class UnmatchedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrgLevelMatchingTests(unittest.TestCase):
+    """match_level='org': one project on the keeping side condemns the other side."""
+
+    def test_one_cli_project_condemns_scm_projects_in_unrelated_repos(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli", url="https://github.com/acme/api"),
+                project("scm-1", "github", url="https://github.com/acme/api"),
+                project("scm-2", "github", url="https://github.com/acme/billing"),
+                project("scm-3", "github", url="https://github.com/acme/web"),
+            ],
+            config(match_level="org"),
+        )
+        self.assertEqual(plan.delete_count, 3)
+        self.assertEqual(
+            {p.id for _, p in plan.projects_to_delete()}, {"scm-1", "scm-2", "scm-3"}
+        )
+
+    def test_an_org_with_no_cli_projects_deletes_nothing(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("scm-1", "github", url="https://github.com/acme/api"),
+                project("scm-2", "github", url="https://github.com/acme/billing"),
+            ],
+            config(match_level="org"),
+        )
+        self.assertEqual(plan.delete_count, 0)
+        self.assertEqual(plan.duplicates, [])
+        self.assertEqual(len(plan.unmatched), 2)
+
+    def test_deleting_the_cli_side_reverses_which_side_condemns(self):
+        projects = [
+            project("cli-1", "cli", url="https://github.com/acme/api"),
+            project("cli-2", "cli", url="https://github.com/acme/billing"),
+            project("scm-1", "github", url="https://github.com/acme/web"),
+        ]
+        plan = build_plan(ORG, projects, config(match_level="org", delete=CLI))
+        self.assertEqual(plan.delete_count, 2)
+        self.assertEqual({p.id for _, p in plan.projects_to_delete()}, {"cli-1", "cli-2"})
+
+    def test_an_org_with_only_cli_projects_deletes_nothing(self):
+        plan = build_plan(
+            ORG,
+            [project("cli-1", "cli"), project("cli-2", "cli")],
+            config(match_level="org"),
+        )
+        self.assertEqual(plan.delete_count, 0)
+
+    def test_non_open_source_projects_are_still_never_touched(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli"),
+                project("scm-1", "github"),
+                project("code-1", "github", ptype="sast"),
+                project("img-1", "github", ptype="dockerfile"),
+                project("iac-1", "github", ptype="terraformconfig"),
+            ],
+            config(match_level="org"),
+        )
+        self.assertEqual({p.id for _, p in plan.projects_to_delete()}, {"scm-1"})
+
+    def test_a_cli_project_without_a_repo_url_still_counts_as_evidence(self):
+        """Org matching compares no URLs, so a missing one is not a reason to skip."""
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli", url=None),
+                project("scm-1", "github", url="https://github.com/acme/api"),
+            ],
+            config(match_level="org"),
+        )
+        self.assertEqual(plan.delete_count, 1)
+        self.assertNotIn(SKIP_NO_REPO_URL, plan.skip_counts())
+
+    def test_inactive_and_unclassified_projects_are_still_skipped(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli", status="inactive"),
+                project("cli-2", "api"),
+                project("scm-1", "github"),
+            ],
+            config(match_level="org"),
+        )
+        self.assertEqual(plan.delete_count, 0)
+
+    def test_the_cap_still_applies(self):
+        projects = [project("cli-1", "cli")] + [
+            project(f"scm-{i}", "github", url=f"https://github.com/acme/r{i}") for i in range(5)
+        ]
+        plan = build_plan(ORG, projects, config(match_level="org", max_deletes_per_org=3))
+        self.assertTrue(plan.capped)
+
+    def test_repo_level_matching_is_unaffected_by_default(self):
+        projects = [
+            project("cli-1", "cli", url="https://github.com/acme/api"),
+            project("scm-1", "github", url="https://github.com/acme/api"),
+            project("scm-2", "github", url="https://github.com/acme/billing"),
+        ]
+        self.assertEqual(build_plan(ORG, projects, config()).delete_count, 1)
+        self.assertEqual(
+            build_plan(ORG, projects, config(match_level="org")).delete_count, 2
+        )
+
+
+class InactiveProjectTests(unittest.TestCase):
+    """delete_inactive lets inactive projects be deleted, never kept."""
+
+    def test_an_inactive_project_is_never_the_side_that_is_kept(self):
+        """The invariant that protects coverage: a dead project cannot stand in for a live one."""
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli", status="inactive"),
+                project("scm-1", "github"),
+                project("scm-2", "github"),
+            ],
+            config(delete_inactive=True),
+        )
+        self.assertEqual(plan.delete_count, 0)
+        self.assertEqual([u.side for u in plan.unmatched], [SCM])
+        self.assertEqual(plan.skip_counts()[SKIP_INACTIVE], 1)
+
+    def test_an_org_whose_only_cli_projects_are_inactive_deletes_nothing(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli", status="inactive"),
+                project("scm-1", "github", url="https://github.com/acme/api"),
+                project("scm-2", "github", url="https://github.com/acme/billing"),
+            ],
+            config(match_level="org", delete_inactive=True),
+        )
+        self.assertEqual(plan.delete_count, 0)
+
+    def test_an_inactive_project_on_the_deleting_side_is_deleted_when_opted_in(self):
+        projects = [project("cli-1", "cli"), project("scm-1", "github", status="inactive")]
+        self.assertEqual(build_plan(ORG, projects, config()).delete_count, 0)
+        self.assertEqual(
+            build_plan(ORG, projects, config(delete_inactive=True)).delete_count, 1
+        )
+
+    def test_an_unknown_or_missing_status_is_never_deletable(self):
+        for status in ("", "unknown", "pending"):
+            with self.subTest(status=status):
+                plan = build_plan(
+                    ORG,
+                    [project("cli-1", "cli"), project("scm-1", "github", status=status)],
+                    config(delete_inactive=True),
+                )
+                self.assertEqual(plan.delete_count, 0)
+                self.assertEqual(plan.skip_counts()[SKIP_INACTIVE], 1)
+
+    def test_deleting_the_cli_side_reverses_which_inactive_projects_are_deletable(self):
+        projects = [project("cli-1", "cli", status="inactive"), project("scm-1", "github")]
+        plan = build_plan(ORG, projects, config(delete=CLI, delete_inactive=True))
+        self.assertEqual({p.id for _, p in plan.projects_to_delete()}, {"cli-1"})
+
+    def test_deleting_an_inactive_project_is_not_a_coverage_drop(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli"),
+                project("scm-1", "github"),
+                project("scm-2", "github", status="inactive"),
+                project("scm-3", "github", status="inactive"),
+            ],
+            config(delete_inactive=True),
+        )
+        self.assertEqual(plan.delete_count, 3)
+        self.assertEqual(plan.coverage_drops, [])
+
+    def test_an_inactive_project_does_not_decide_the_default_branch(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli"),
+                project("scm-1", "github", ref="release", status="inactive"),
+                project("scm-2", "github", ref="release", status="inactive"),
+                project("scm-3", "github", ref="develop"),
+            ],
+            config(branch_match="scm_default", default_branches=(), delete_inactive=True),
+        )
+        # 'release' has more projects, but they are dead; 'develop' is the live branch.
+        self.assertEqual({p.id for _, p in plan.projects_to_delete()}, {"scm-3"})
+
+    def test_inactive_projects_still_count_as_open_source(self):
+        plan = build_plan(
+            ORG,
+            [project("cli-1", "cli"), project("scm-1", "github", status="inactive")],
+            config(),
+        )
+        self.assertEqual(plan.oss_projects, 2)
+
+
+class InactiveRegressionTests(unittest.TestCase):
+    """The opt-in must not change anything while it is off."""
+
+    def test_an_inactive_unclassified_project_still_reports_inactive(self):
+        """With the flag off, `inactive` wins the race, so triage counts stay clean."""
+        plan = build_plan(ORG, [project("x-1", "api", status="inactive")], config())
+        self.assertEqual(plan.skip_counts()[SKIP_INACTIVE], 1)
+        self.assertNotIn(SKIP_UNCLASSIFIED_ORIGIN, plan.skip_counts())
+
+    def test_an_inactive_project_without_a_repo_url_still_reports_inactive(self):
+        plan = build_plan(ORG, [project("x-1", "cli", status="inactive", url=None)], config())
+        self.assertEqual(plan.skip_counts()[SKIP_INACTIVE], 1)
+        self.assertNotIn(SKIP_NO_REPO_URL, plan.skip_counts())
+
+    def test_surrounding_whitespace_in_a_status_does_not_change_the_verdict(self):
+        projects = [project("cli-1", "cli", status=" active "),
+                    project("scm-1", "github", status=" inactive ")]
+        self.assertEqual(build_plan(ORG, projects, config()).delete_count, 0)
+        self.assertEqual(
+            build_plan(ORG, projects, config(delete_inactive=True)).delete_count, 1
+        )
+
+    def test_the_kept_side_never_contains_an_inactive_project(self):
+        """The contract the whole opt-in rests on, asserted over every duplicate."""
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli"),
+                project("cli-2", "cli", status="inactive"),
+                project("scm-1", "github"),
+                project("scm-2", "github", status="inactive"),
+            ],
+            config(delete_inactive=True),
+        )
+        for duplicate in plan.duplicates:
+            self.assertTrue(all(p.is_active for p in duplicate.to_keep))
+
+    def test_the_inactive_delete_count_is_reported(self):
+        plan = build_plan(
+            ORG,
+            [
+                project("cli-1", "cli"),
+                project("scm-1", "github"),
+                project("scm-2", "github", status="inactive"),
+            ],
+            config(delete_inactive=True),
+        )
+        self.assertEqual(plan.delete_count, 2)
+        self.assertEqual(plan.inactive_delete_count(), 1)

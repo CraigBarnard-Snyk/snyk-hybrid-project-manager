@@ -12,6 +12,7 @@ from .api import MAX_BULK_DELETE, SnykApiError, SnykClient, chunked
 from .config import (
     BRANCH_MATCH_MODES,
     DELETE_SIDES,
+    MATCH_LEVELS,
     MAX_RETRIES,
     REQUEST_TIMEOUT,
     Config,
@@ -19,7 +20,7 @@ from .config import (
     load_config,
     read_token,
 )
-from .matching import CLI, SCM, parse_project
+from .matching import CLI, SCM, Project, parse_project
 from .planner import (
     SKIP_NON_DEFAULT_BRANCH,
     SKIP_NO_REPO_URL,
@@ -79,6 +80,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="override which side to delete for every org in this run",
     )
     parser.add_argument(
+        "--match-level",
+        choices=MATCH_LEVELS,
+        help=(
+            "how loosely to match. 'repo' (default) needs a repo covered by both sides; "
+            "'org' deletes every project on one side of an org if the other side has even one"
+        ),
+    )
+    parser.add_argument(
+        "--delete-inactive",
+        action="store_true",
+        help=(
+            "also delete inactive projects on the side being deleted. They are never "
+            "kept, and never count as evidence that a side is in use"
+        ),
+    )
+    parser.add_argument(
         "--branch-match",
         choices=BRANCH_MATCH_MODES,
         help="override branch matching for every org in this run",
@@ -126,6 +143,12 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> tuple[Config, l
     if args.delete:
         config = replace(config, delete=args.delete)
         notes.append(f"--delete {args.delete} overrides the config file")
+    if args.match_level:
+        config = replace(config, match_level=args.match_level)
+        notes.append(f"--match-level {args.match_level} overrides the config file")
+    if args.delete_inactive:
+        config = replace(config, delete_inactive=True)
+        notes.append("--delete-inactive overrides the config file")
     if args.branch_match:
         config = replace(config, branch_match=args.branch_match)
         notes.append(f"--branch-match {args.branch_match} overrides the config file")
@@ -245,14 +268,24 @@ def duplicate_event(
         exclude_from_future_scans=(
             plan.config.exclude_from_future_scans if duplicate.delete_side == SCM else False
         ),
-        deleting=[describe_project(p, duplicate.repo) for p in duplicate.to_delete],
-        keeping=[describe_project(p, duplicate.repo) for p in duplicate.to_keep],
+        match_level=plan.config.match_level,
+        deleting=[describe_project(p) for p in duplicate.to_delete],
+        keeping=[describe_project(p) for p in duplicate.to_keep],
     )
 
 
+def _project_list(projects: Sequence[Project], limit: int = 10) -> str:
+    """Name the projects, abbreviating the long lists that org matching produces."""
+    shown = ", ".join(
+        f"{p.name} [{p.type}]{'' if p.is_active else ' INACTIVE'}" for p in projects[:limit]
+    )
+    remaining = len(projects) - limit
+    return f"{shown}, and {remaining} more" if remaining > 0 else shown
+
+
 def describe_duplicate(duplicate: Duplicate) -> str:
-    keep = ", ".join(f"{p.name} [{p.type}]" for p in duplicate.to_keep)
-    delete = ", ".join(f"{p.name} [{p.type}]" for p in duplicate.to_delete)
+    keep = _project_list(duplicate.to_keep)
+    delete = _project_list(duplicate.to_delete)
     flag = " COVERAGE DROP" if duplicate.coverage_drop else ""
     return (
         f"{duplicate.repo}{flag}\n"
@@ -410,22 +443,39 @@ def plan_org(
     log_all_skips: bool = False,
 ) -> OrgPlan:
     reporter.log.info(
-        "Scanning %s (delete=%s, branch_match=%s)",
+        "Scanning %s (delete=%s, match_level=%s, branch_match=%s)",
         org.label,
         config.delete,
+        config.match_level,
         config.branch_match,
     )
     projects = [parse_project(payload) for payload in client.list_projects(org.id)]
     plan = build_plan(org, projects, config)
 
     skips = plan.skip_counts()
-    reporter.log.info(
-        "  %d project(s): %d open source, %d duplicate project(s) in %d repo(s)",
-        plan.total_projects,
-        plan.oss_projects,
-        plan.duplicate_project_count,
-        len(plan.duplicates),
-    )
+    if config.match_level == "org":
+        reporter.log.info(
+            "  %d project(s): %d open source, %d %s project(s) to delete across the whole org",
+            plan.total_projects,
+            plan.oss_projects,
+            plan.duplicate_project_count,
+            config.delete,
+        )
+    else:
+        reporter.log.info(
+            "  %d project(s): %d open source, %d duplicate project(s) in %d repo(s)",
+            plan.total_projects,
+            plan.oss_projects,
+            plan.duplicate_project_count,
+            len(plan.duplicates),
+        )
+    dead = plan.inactive_delete_count()
+    if dead:
+        reporter.log.info(
+            "  %d of those %d project(s) are already inactive",
+            dead,
+            plan.delete_count,
+        )
     if skips:
         reporter.log.info(
             "  skipped: %s",
@@ -433,12 +483,12 @@ def plan_org(
         )
     for duplicate in plan.coverage_drops:
         reporter.log.warning(
-            "  %s: deleting %d %s project(s) but keeping only %d %s project(s); "
+            "  %s: deleting %d live %s project(s) but keeping only %d live %s project(s); "
             "the rest of the repo will no longer be monitored",
             duplicate.repo,
-            len(duplicate.to_delete),
+            duplicate.active_delete_count,
             duplicate.delete_side,
-            len(duplicate.to_keep),
+            duplicate.active_keep_count,
             CLI if duplicate.delete_side == SCM else SCM,
         )
     if plan.unmatched:
@@ -467,6 +517,8 @@ def plan_org(
         org_name=org.name,
         org_slug=org.slug,
         delete_side=config.delete,
+        match_level=config.match_level,
+        delete_inactive=config.delete_inactive,
         branch_match=config.branch_match,
         max_deletes_per_org=config.max_deletes_per_org,
         total_projects=plan.total_projects,
@@ -476,6 +528,7 @@ def plan_org(
         coverage_drop_repos=len(plan.coverage_drops),
         unmatched_repos=dict(plan.unmatched_counts()),
         projects_to_delete=plan.delete_count,
+        inactive_projects_to_delete=plan.inactive_delete_count(),
         capped=plan.capped,
         skips=dict(skips),
         type_census=dict(plan.type_census),
@@ -500,12 +553,31 @@ def run(args: argparse.Namespace) -> int:
         for note in notes:
             log.warning("Override: %s", note)
 
+        if config.delete_inactive:
+            log.warning(
+                "Deleting inactive projects. The API does not say whether a project was "
+                "deactivated automatically (its manifest was removed) or by someone on "
+                "purpose, so both go, along with their history and ignores."
+            )
+
+        if config.match_level == "org":
+            keep_side = CLI if config.delete == SCM else SCM
+            log.warning(
+                "Match level: ORG. Repo URLs are not compared. In any org holding at least one "
+                "open source %s project, EVERY open source %s project is deleted, whatever repo "
+                "it belongs to. Read the dry run before using --execute.",
+                keep_side,
+                config.delete,
+            )
+
         reporter.event(
             "run_start",
             version=__version__,
             api_url=config.api_url,
             api_version=config.api_version,
             delete=config.delete,
+            match_level=config.match_level,
+            delete_inactive=config.delete_inactive,
             branch_match=config.branch_match,
             exclude_from_future_scans=config.exclude_from_future_scans,
             max_deletes_per_org=config.max_deletes_per_org,
@@ -608,9 +680,10 @@ def run(args: argparse.Namespace) -> int:
         log.info("-" * 72)
         log.info("Organizations processed        : %d", len(plans))
         log.info(
-            "Duplicate projects found      : %d in %d repo(s)",
+            "Duplicate projects found      : %d in %d %s",
             duplicate_total,
             repo_total,
+            "org(s)" if config.match_level == "org" else "repo(s)",
         )
         if dry_run:
             log.info("Projects that WOULD be deleted: %d", planned_total)

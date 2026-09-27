@@ -56,6 +56,27 @@ class LoadConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "delete must be one of"):
             load_config(write(MINIMAL + "\ndelete: both\n"))
 
+    def test_match_level_defaults_to_repo(self):
+        self.assertEqual(load_config(write(MINIMAL)).match_level, "repo")
+
+    def test_accepts_org_match_level(self):
+        config = load_config(write(MINIMAL + "\nmatch_level: org\n"))
+        self.assertEqual(config.match_level, "org")
+
+    def test_delete_inactive_defaults_to_false(self):
+        self.assertFalse(load_config(write(MINIMAL)).delete_inactive)
+
+    def test_accepts_delete_inactive(self):
+        self.assertTrue(load_config(write(MINIMAL + "\ndelete_inactive: true\n")).delete_inactive)
+
+    def test_rejects_a_non_boolean_delete_inactive(self):
+        with self.assertRaisesRegex(ConfigError, "delete_inactive must be true or false"):
+            load_config(write(MINIMAL + "\ndelete_inactive: sometimes\n"))
+
+    def test_rejects_an_invalid_match_level(self):
+        with self.assertRaisesRegex(ConfigError, "match_level must be one of"):
+            load_config(write(MINIMAL + "\nmatch_level: loose\n"))
+
     def test_rejects_an_invalid_branch_match_mode(self):
         with self.assertRaisesRegex(ConfigError, "branch_match must be one of"):
             load_config(write(MINIMAL + "\nbranch_match: fuzzy\n"))

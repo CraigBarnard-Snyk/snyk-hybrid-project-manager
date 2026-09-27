@@ -22,6 +22,15 @@ orgs:
 #   exclude_orgs:
 #     - sandbox
 
+# --- How loosely to match ---------------------------------------------------
+# repo -> a repo must hold projects from BOTH sides before anything is deleted
+#         (default; repo URLs are compared)
+# org  -> if the org holds even ONE open source project on the side being kept,
+#         EVERY open source project on the side being deleted goes, whatever
+#         repo it belongs to. Repo URLs are not compared at all. This deletes
+#         far more than repo matching: dry-run it first.
+# match_level: repo
+
 # Regional tenant: https://api.snyk.io | https://api.eu.snyk.io | https://api.au.snyk.io
 api_url: https://api.snyk.io
 
@@ -42,6 +51,14 @@ api_url: https://api.snyk.io
 # default_branches:
 #   - main
 #   - master
+
+# Delete inactive projects too. They are skipped by default, because the API
+# does not say whether a project was deactivated automatically (its manifest was
+# removed) or by a person on purpose, and deleting the latter throws away that
+# decision along with the project's history and ignores. Even when this is on,
+# an inactive project is only ever deleted, never kept: a repo whose CLI project
+# is inactive keeps its live SCM projects.
+# delete_inactive: false
 
 # Safety valve: skip an org entirely if its plan would delete more than this
 # many projects. Omit or set to null for no cap.

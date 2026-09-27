@@ -304,3 +304,95 @@ class ConfigErrorTests(CliTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrgMatchLevelTests(CliTestCase):
+    def test_org_level_deletes_scm_projects_in_repos_with_no_cli_counterpart(self):
+        client = FakeClient([
+            project_payload("cli-1", "cli", url="https://github.com/acme/api"),
+            project_payload("scm-1", "github", url="https://github.com/acme/api"),
+            project_payload("scm-2", "github", url="https://github.com/acme/billing"),
+        ])
+        code = self.run_cli(
+            ["--config", self.write_config(), "--match-level", "org", "--execute"], client
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(sorted(client.delete_calls[0]["ids"]), ["scm-1", "scm-2"])
+
+    def test_org_level_with_no_cli_projects_deletes_nothing(self):
+        client = FakeClient([
+            project_payload("scm-1", "github", url="https://github.com/acme/api"),
+            project_payload("scm-2", "github", url="https://github.com/acme/billing"),
+        ])
+        code = self.run_cli(
+            ["--config", self.write_config(), "--match-level", "org", "--execute"], client
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(client.delete_calls, [])
+
+    def test_org_level_warns_loudly_and_records_the_match_level(self):
+        client = FakeClient([
+            project_payload("cli-1", "cli"),
+            project_payload("scm-1", "github"),
+        ])
+        self.run_cli(["--config", self.write_config(), "--match-level", "org"], client)
+        self.assertIn("Match level: ORG", self.stdout.getvalue())
+        self.assertEqual(self.events_of("run_start")[0]["match_level"], "org")
+        self.assertEqual(self.events_of("org_summary")[0]["match_level"], "org")
+
+    def test_each_deleted_project_keeps_its_own_repo_url_in_the_log(self):
+        client = FakeClient([
+            project_payload("cli-1", "cli", url="https://github.com/acme/api"),
+            project_payload("scm-1", "github", url="https://github.com/acme/api"),
+            project_payload("scm-2", "github", url="https://github.com/acme/billing"),
+        ])
+        self.run_cli(["--config", self.write_config(), "--match-level", "org"], client)
+        deleting = self.events_of("duplicate")[0]["deleting"]
+        self.assertEqual(
+            {p["canonical_repo_url"] for p in deleting},
+            {"github.com/acme/api", "github.com/acme/billing"},
+        )
+
+    def test_repo_level_remains_the_default(self):
+        client = FakeClient([
+            project_payload("cli-1", "cli", url="https://github.com/acme/api"),
+            project_payload("scm-1", "github", url="https://github.com/acme/api"),
+            project_payload("scm-2", "github", url="https://github.com/acme/billing"),
+        ])
+        self.run_cli(["--config", self.write_config(), "--execute"], client)
+        self.assertEqual(client.delete_calls[0]["ids"], ["scm-1"])
+
+
+class DeleteInactiveTests(CliTestCase):
+    def test_inactive_projects_survive_by_default(self):
+        client = FakeClient([
+            project_payload("cli-1", "cli"),
+            project_payload("scm-1", "github", status="inactive", target_file="old.json"),
+        ])
+        code = self.run_cli(["--config", self.write_config(), "--execute"], client)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(client.delete_calls, [])
+
+    def test_the_flag_deletes_them_and_warns(self):
+        client = FakeClient([
+            project_payload("cli-1", "cli"),
+            project_payload("scm-1", "github", status="inactive", target_file="old.json"),
+        ])
+        code = self.run_cli(
+            ["--config", self.write_config(), "--delete-inactive", "--execute"], client
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(client.delete_calls[0]["ids"], ["scm-1"])
+        self.assertIn("deactivated automatically", self.stdout.getvalue())
+        self.assertTrue(self.events_of("run_start")[0]["delete_inactive"])
+
+    def test_an_inactive_cli_project_never_licenses_deleting_live_scm_projects(self):
+        client = FakeClient([
+            project_payload("cli-1", "cli", status="inactive"),
+            project_payload("scm-1", "github"),
+        ])
+        code = self.run_cli(
+            ["--config", self.write_config(), "--delete-inactive", "--execute"], client
+        )
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(client.delete_calls, [])

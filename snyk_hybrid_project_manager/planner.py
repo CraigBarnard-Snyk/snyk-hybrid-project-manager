@@ -24,6 +24,10 @@ SKIP_UNCLASSIFIED_ORIGIN = "origin_not_classified"
 SKIP_NO_REPO_URL = "no_repo_url"
 SKIP_NON_DEFAULT_BRANCH = "non_default_branch"
 
+# Stand-ins for a repo URL in records that are not keyed on one.
+ORG_WIDE = "<entire org>"
+NO_REPO_URL = "<no repo url>"
+
 
 @dataclass(frozen=True)
 class Org:
@@ -83,8 +87,19 @@ class Duplicate:
 
         Deleting the SCM side of a repo whose CI only ever scanned one manifest
         leaves the rest unmonitored. Reported, not blocked.
+
+        Only active projects count on either side: deleting an inactive project
+        loses no coverage, and an inactive one provides none.
         """
-        return len(self.to_delete) > len(self.to_keep)
+        return self.active_delete_count > self.active_keep_count
+
+    @property
+    def active_delete_count(self) -> int:
+        return sum(1 for p in self.to_delete if p.is_active)
+
+    @property
+    def active_keep_count(self) -> int:
+        return sum(1 for p in self.to_keep if p.is_active)
 
 
 @dataclass
@@ -120,12 +135,27 @@ class OrgPlan:
     def projects_to_delete(self) -> list[tuple[Duplicate, Project]]:
         return [(d, p) for d in self.active_duplicates for p in d.to_delete]
 
+    def inactive_delete_count(self) -> int:
+        """Of the projects this run would remove, how many are already dead."""
+        return sum(1 for _, p in self.projects_to_delete() if not p.is_active)
+
     def skip_counts(self) -> Counter:
         return Counter(s.reason for s in self.skips)
 
     def unmatched_counts(self) -> Counter:
         """Repos with only one side, by side."""
         return Counter(u.side for u in self.unmatched)
+
+
+def _inactive_is_deletable(project: Project, side: str, config: Config) -> bool:
+    """An inactive project may be deleted when opted in, but is never kept.
+
+    Keeping a dead project in place of a live one would leave the repo
+    unmonitored, so an inactive project on the side being kept is always
+    skipped. Only an explicitly inactive status qualifies: a missing or
+    unrecognised one is not evidence of anything.
+    """
+    return config.delete_inactive and project.is_inactive and side == config.delete
 
 
 def _default_branch_by_repo(
@@ -135,7 +165,9 @@ def _default_branch_by_repo(
     """Choose one default branch per repo from the SCM projects present."""
     by_repo: dict[str, dict[str, list[Project]]] = defaultdict(lambda: defaultdict(list))
     for project, repo in scm_projects:
-        by_repo[repo][normalise_branch(project.target_reference)].append(project)
+        # An inactive project should not tip the "busiest branch" heuristic.
+        if project.is_active:
+            by_repo[repo][normalise_branch(project.target_reference)].append(project)
 
     chosen: dict[str, str] = {}
     for repo, branches in by_repo.items():
@@ -169,7 +201,10 @@ def build_plan(org: Org, projects: Iterable[Project], config: Config) -> OrgPlan
 
         plan.oss_projects += 1
 
-        if not project.is_active:
+        # Cheap gate first so the default path is untouched: with the opt-in
+        # off, an inactive project never reaches classification, and still
+        # reports `inactive` rather than whatever it would fail next.
+        if not project.is_active and not config.delete_inactive:
             plan.skips.append(Skip(project, SKIP_INACTIVE, project.status))
             continue
 
@@ -178,8 +213,14 @@ def build_plan(org: Org, projects: Iterable[Project], config: Config) -> OrgPlan
             plan.skips.append(Skip(project, SKIP_UNCLASSIFIED_ORIGIN, project.origin))
             continue
 
+        if not project.is_active and not _inactive_is_deletable(project, side, config):
+            plan.skips.append(Skip(project, SKIP_INACTIVE, project.status))
+            continue
+
         repo = canonical_repo_url(project.target_url)
-        if not repo:
+        if not repo and config.match_level == "repo":
+            # Repo matching has nothing to match on without a URL. Org matching
+            # does not need one, so there it is not a reason to skip.
             plan.skips.append(
                 Skip(project, SKIP_NO_REPO_URL, project.target_display_name or "")
             )
@@ -190,14 +231,13 @@ def build_plan(org: Org, projects: Iterable[Project], config: Config) -> OrgPlan
     default_branches: dict[str, str] = {}
     if config.branch_match == "scm_default":
         default_branches = _default_branch_by_repo(
-            [(p, repo) for p, side, repo in classified if side == SCM],
+            [(p, repo) for p, side, repo in classified if side == SCM and repo],
             config.default_branches,
         )
 
-    by_repo: dict[str, dict[str, list[Project]]] = defaultdict(lambda: {CLI: [], SCM: []})
-
+    eligible: list[tuple[Project, str, str | None]] = []
     for project, side, repo in classified:
-        if config.branch_match == "scm_default" and side == SCM:
+        if config.branch_match == "scm_default" and side == SCM and repo:
             expected = default_branches.get(repo)
             if expected is not None and normalise_branch(project.target_reference) != expected:
                 plan.skips.append(
@@ -208,29 +248,12 @@ def build_plan(org: Org, projects: Iterable[Project], config: Config) -> OrgPlan
                     )
                 )
                 continue
-        by_repo[repo][side].append(project)
+        eligible.append((project, side, repo))
 
-    for repo in sorted(by_repo):
-        sides = by_repo[repo]
-        if sides[CLI] and sides[SCM]:
-            plan.duplicates.append(
-                Duplicate(
-                    repo=repo,
-                    cli=tuple(sorted(sides[CLI], key=lambda p: (p.created, p.id))),
-                    scm=tuple(sorted(sides[SCM], key=lambda p: (p.created, p.id))),
-                    delete_side=config.delete,
-                )
-            )
-            continue
-        for side in (CLI, SCM):
-            if sides[side]:
-                plan.unmatched.append(
-                    Unmatched(
-                        repo=repo,
-                        side=side,
-                        projects=tuple(sorted(sides[side], key=lambda p: (p.created, p.id))),
-                    )
-                )
+    if config.match_level == "org":
+        _plan_org_level(plan, eligible, config)
+    else:
+        _plan_repo_level(plan, eligible, config)
 
     if (
         config.max_deletes_per_org is not None
@@ -239,6 +262,82 @@ def build_plan(org: Org, projects: Iterable[Project], config: Config) -> OrgPlan
         plan.capped = True
 
     return plan
+
+
+def _by_repo(
+    eligible: Sequence[tuple[Project, str, str | None]],
+) -> dict[str, dict[str, list[Project]]]:
+    grouped: dict[str, dict[str, list[Project]]] = defaultdict(lambda: {CLI: [], SCM: []})
+    for project, side, repo in eligible:
+        grouped[repo or NO_REPO_URL][side].append(project)
+    return grouped
+
+
+def _sorted(projects: Iterable[Project]) -> tuple[Project, ...]:
+    return tuple(sorted(projects, key=lambda p: (p.created, p.id)))
+
+
+def _plan_repo_level(
+    plan: OrgPlan,
+    eligible: Sequence[tuple[Project, str, str | None]],
+    config: Config,
+) -> None:
+    """Default matching: a repo must be covered by both sides to be a duplicate."""
+    grouped = _by_repo(eligible)
+    for repo in sorted(grouped):
+        sides = grouped[repo]
+        if sides[CLI] and sides[SCM]:
+            plan.duplicates.append(
+                Duplicate(
+                    repo=repo,
+                    cli=_sorted(sides[CLI]),
+                    scm=_sorted(sides[SCM]),
+                    delete_side=config.delete,
+                )
+            )
+            continue
+        for side in (CLI, SCM):
+            if sides[side]:
+                plan.unmatched.append(
+                    Unmatched(repo=repo, side=side, projects=_sorted(sides[side]))
+                )
+
+
+def _plan_org_level(
+    plan: OrgPlan,
+    eligible: Sequence[tuple[Project, str, str | None]],
+    config: Config,
+) -> None:
+    """Loose matching: one project on the keeping side condemns the whole other side.
+
+    Repo URLs are not compared at all. If the org has even one Open Source
+    project on the side being kept, every Open Source project on the side being
+    deleted goes, whatever repo it belongs to.
+    """
+    by_side: dict[str, list[Project]] = {CLI: [], SCM: []}
+    for project, side, _ in eligible:
+        by_side[side].append(project)
+
+    keep_side = CLI if config.delete == SCM else SCM
+    if by_side[keep_side] and by_side[config.delete]:
+        plan.duplicates.append(
+            Duplicate(
+                repo=ORG_WIDE,
+                cli=_sorted(by_side[CLI]),
+                scm=_sorted(by_side[SCM]),
+                delete_side=config.delete,
+            )
+        )
+        return
+
+    # The org has only one side, so nothing is condemned. Record what is there.
+    grouped = _by_repo(eligible)
+    for repo in sorted(grouped):
+        for side in (CLI, SCM):
+            if grouped[repo][side]:
+                plan.unmatched.append(
+                    Unmatched(repo=repo, side=side, projects=_sorted(grouped[repo][side]))
+                )
 
 
 def describe_project(project: Project, repo: str | None = None) -> dict[str, object]:
@@ -254,6 +353,6 @@ def describe_project(project: Project, repo: str | None = None) -> dict[str, obj
         "created": project.created,
         "target_id": project.target_id,
         "target_url": project.target_url,
-        "canonical_repo_url": repo,
+        "canonical_repo_url": repo if repo is not None else canonical_repo_url(project.target_url),
         "manifest_path": project_path(project),
     }

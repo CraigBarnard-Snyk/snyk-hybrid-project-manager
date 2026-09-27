@@ -65,6 +65,16 @@ class CanonicalRepoUrlTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(canonical_repo_url(url), expected)
 
+    def test_legacy_vsts_ssh_and_https_forms_converge(self):
+        """Legacy VSTS puts the org in the host over HTTPS, in the path over SSH."""
+        expected = "acme.visualstudio.com/project/api"
+        self.assertEqual(
+            canonical_repo_url("https://acme.visualstudio.com/project/_git/api"), expected
+        )
+        self.assertEqual(
+            canonical_repo_url("git@vs-ssh.visualstudio.com:v3/acme/project/api"), expected
+        )
+
     def test_github_ssh_alias_host_is_folded(self):
         self.assertEqual(
             canonical_repo_url("git@ssh.github.com:acme/api.git"), "github.com/acme/api"

@@ -71,6 +71,12 @@ def canonical_repo_url(url: str | None) -> str | None:
     # Azure DevOps SSH remotes are git@ssh.dev.azure.com:v3/org/project/repo.
     if segments and segments[0].lower() == "v3" and ("azure" in host or "visualstudio" in host):
         segments = segments[1:]
+        # Legacy VSTS puts the organization in the host over HTTPS
+        # (acme.visualstudio.com/project/_git/repo) but in the path over SSH
+        # (vs-ssh.visualstudio.com:v3/acme/project/repo).
+        if host == "vs-ssh.visualstudio.com" and segments:
+            host = f"{segments[0].lower()}.visualstudio.com"
+            segments = segments[1:]
     if segments and segments[0].lower() in {"scm", "_git"}:
         segments = segments[1:]
     segments = [s for s in segments if s.lower() != "_git"]
@@ -140,7 +146,12 @@ class Project:
 
     @property
     def is_active(self) -> bool:
-        return self.status.lower() == "active"
+        return self.status.strip().lower() == "active"
+
+    @property
+    def is_inactive(self) -> bool:
+        """Explicitly inactive. An empty or unrecognised status is neither."""
+        return self.status.strip().lower() == "inactive"
 
 
 def _target_relationship(payload: Mapping[str, Any]) -> Mapping[str, Any]:
